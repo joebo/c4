@@ -6,11 +6,30 @@
 
 // Written by Robert Swierczek
 // + x86 JIT compiler by Dmytro Sirenko
-
+// + win32 port by Joe Bogner
 #include <stdio.h>
 #include <stdlib.h>
 #include <memory.h>
+
+#ifdef _WIN32
+#define PROT_NONE       0
+#define PROT_READ       1
+#define PROT_WRITE      2
+#define PROT_EXEC       4
+
+#define MAP_FILE        0
+#define MAP_SHARED      1
+#define MAP_PRIVATE     2
+#define MAP_TYPE        0xf
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+#define MAP_ANON        MAP_ANONYMOUS
+#define MAP_FAILED      ((void *)-1)
+
+void*   mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off);
+#else
 #include <sys/mman.h>
+#endif
 
 char *p, *lp, // current position in source code
      *jitmem, // executable memory for JIT-compiled native code
@@ -44,7 +63,7 @@ enum Opcode {
 };
 
 // types
-enum Ty { CHAR, INT, PTR };
+enum Ty { TYCHAR, TYINT, PTR };
 
 // identifier offsets (since we can't create an ident struct)
 enum Identifier { Tk, Hash, Name, Class, Type, Val, HClass, HType, HVal, Idsz };
@@ -128,7 +147,7 @@ expr(int lev)
   int t, *d;
 
   if (!tk) { printf("%d: unexpected eof in expression\n", line); exit(-1); }
-  else if (tk == Num) { *++e = IMM; *++e = ival; next(); ty = INT; }
+  else if (tk == Num) { *++e = IMM; *++e = ival; next(); ty = TYINT; }
   else if (tk == '"') {
     *++e = IMM; *++e = ival; next();
     while (tk == '"') next();
@@ -147,18 +166,18 @@ expr(int lev)
       if (t) { *++e = ADJ; *++e = t; }
       ty = d[Type];
     }
-    else if (d[Class] == Num) { *++e = IMM; *++e = d[Val]; ty = INT; }
+    else if (d[Class] == Num) { *++e = IMM; *++e = d[Val]; ty = TYINT; }
     else {
       if (d[Class] == Loc) { *++e = LEA; *++e = loc - d[Val]; }
       else if (d[Class] == Glo) { *++e = IMM; *++e = d[Val]; }
       else { printf("%d: undefined variable\n", line); exit(-1); }
-      *++e = ((ty = d[Type]) == CHAR) ? LC : LI;
+      *++e = ((ty = d[Type]) == TYCHAR) ? LC : LI;
     }
   }
   else if (tk == '(') {
     next();
     if (tk == Int || tk == Char) {
-      t = (tk == Int) ? INT : CHAR; next();
+      t = (tk == Int) ? TYINT : TYCHAR; next();
       while (tk == Mul) { next(); t = t + PTR; }
       if (tk == ')') next(); else { printf("%d: bad cast\n", line); exit(-1); }
       expr(Inc);
@@ -171,21 +190,21 @@ expr(int lev)
   }
   else if (tk == Mul) {
     next(); expr(Inc);
-    if (ty > INT) ty = ty - PTR; else { printf("%d: bad dereference\n", line); exit(-1); }
-    *++e = (ty == CHAR) ? LC : LI;
+    if (ty > TYINT) ty = ty - PTR; else { printf("%d: bad dereference\n", line); exit(-1); }
+    *++e = (ty == TYCHAR) ? LC : LI;
   }
   else if (tk == And) {
     next(); expr(Inc);
     if (*e == LC || *e == LI) --e; else { printf("%d: bad address-of\n", line); exit(-1); }
     ty = ty + PTR;
   }
-  else if (tk == '!') { next(); expr(Inc); *++e = PSH; *++e = IMM; *++e = 0; *++e = EQ; ty = INT; }
-  else if (tk == '~') { next(); expr(Inc); *++e = PSH; *++e = IMM; *++e = -1; *++e = XOR; ty = INT; }
-  else if (tk == Add) { next(); expr(Inc); ty = INT; }
+  else if (tk == '!') { next(); expr(Inc); *++e = PSH; *++e = IMM; *++e = 0; *++e = EQ; ty = TYINT; }
+  else if (tk == '~') { next(); expr(Inc); *++e = PSH; *++e = IMM; *++e = -1; *++e = XOR; ty = TYINT; }
+  else if (tk == Add) { next(); expr(Inc); ty = TYINT; }
   else if (tk == Sub) {
     next(); *++e = IMM;
     if (tk == Num) { *++e = -ival; next(); } else { *++e = -1; *++e = PSH; expr(Inc); *++e = MUL; }
-    ty = INT;
+    ty = TYINT;
   }
   else if (tk == Inc || tk == Dec) {
     t = tk; next(); expr(Inc);
@@ -195,7 +214,7 @@ expr(int lev)
     *++e = PSH;
     *++e = IMM; *++e = (ty > PTR) ? 4 : 1;
     *++e = (t == Inc) ? ADD : SUB;
-    *++e = (ty == CHAR) ? SC : SI;
+    *++e = (ty == TYCHAR) ? SC : SI;
   }
   else { printf("%d: bad expression\n", line); exit(-1); }
 
@@ -204,7 +223,7 @@ expr(int lev)
     if (tk == Assign) {
       next();
       if (*e == LC || *e == LI) *e = PSH; else { printf("%d: bad lvalue in assignment\n", line); exit(-1); }
-      expr(Assign); *++e = ((ty = t) == CHAR) ? SC : SI;
+      expr(Assign); *++e = ((ty = t) == TYCHAR) ? SC : SI;
     }
     else if (tk == Cond) {
       next();
@@ -215,19 +234,19 @@ expr(int lev)
       expr(Cond);
       *d = (int)(e + 1);
     }
-    else if (tk == Lor) { next(); *++e = BNZ; d = ++e; expr(Lan); *d = (int)(e + 1); ty = INT; }
-    else if (tk == Lan) { next(); *++e = BZ;  d = ++e; expr(Or);  *d = (int)(e + 1); ty = INT; }
-    else if (tk == Or)  { next(); *++e = PSH; expr(Xor); *++e = OR;  ty = INT; }
-    else if (tk == Xor) { next(); *++e = PSH; expr(And); *++e = XOR; ty = INT; }
-    else if (tk == And) { next(); *++e = PSH; expr(Eq);  *++e = AND; ty = INT; }
-    else if (tk == Eq)  { next(); *++e = PSH; expr(Lt);  *++e = EQ;  ty = INT; }
-    else if (tk == Ne)  { next(); *++e = PSH; expr(Lt);  *++e = NE;  ty = INT; }
-    else if (tk == Lt)  { next(); *++e = PSH; expr(Shl); *++e = LT;  ty = INT; }
-    else if (tk == Gt)  { next(); *++e = PSH; expr(Shl); *++e = GT;  ty = INT; }
-    else if (tk == Le)  { next(); *++e = PSH; expr(Shl); *++e = LE;  ty = INT; }
-    else if (tk == Ge)  { next(); *++e = PSH; expr(Shl); *++e = GE;  ty = INT; }
-    else if (tk == Shl) { next(); *++e = PSH; expr(Add); *++e = SHL; ty = INT; }
-    else if (tk == Shr) { next(); *++e = PSH; expr(Add); *++e = SHR; ty = INT; }
+    else if (tk == Lor) { next(); *++e = BNZ; d = ++e; expr(Lan); *d = (int)(e + 1); ty = TYINT; }
+    else if (tk == Lan) { next(); *++e = BZ;  d = ++e; expr(Or);  *d = (int)(e + 1); ty = TYINT; }
+    else if (tk == Or)  { next(); *++e = PSH; expr(Xor); *++e = OR;  ty = TYINT; }
+    else if (tk == Xor) { next(); *++e = PSH; expr(And); *++e = XOR; ty = TYINT; }
+    else if (tk == And) { next(); *++e = PSH; expr(Eq);  *++e = AND; ty = TYINT; }
+    else if (tk == Eq)  { next(); *++e = PSH; expr(Lt);  *++e = EQ;  ty = TYINT; }
+    else if (tk == Ne)  { next(); *++e = PSH; expr(Lt);  *++e = NE;  ty = TYINT; }
+    else if (tk == Lt)  { next(); *++e = PSH; expr(Shl); *++e = LT;  ty = TYINT; }
+    else if (tk == Gt)  { next(); *++e = PSH; expr(Shl); *++e = GT;  ty = TYINT; }
+    else if (tk == Le)  { next(); *++e = PSH; expr(Shl); *++e = LE;  ty = TYINT; }
+    else if (tk == Ge)  { next(); *++e = PSH; expr(Shl); *++e = GE;  ty = TYINT; }
+    else if (tk == Shl) { next(); *++e = PSH; expr(Add); *++e = SHL; ty = TYINT; }
+    else if (tk == Shr) { next(); *++e = PSH; expr(Add); *++e = SHR; ty = TYINT; }
     else if (tk == Add) {
       next(); *++e = PSH; expr(Mul);
       if ((ty = t) > PTR) { *++e = PSH; *++e = IMM; *++e = 4; *++e = MUL;  }
@@ -238,16 +257,16 @@ expr(int lev)
       if ((ty = t) > PTR) { *++e = PSH; *++e = IMM; *++e = 4; *++e = MUL;  }
       *++e = SUB;
     }
-    else if (tk == Mul) { next(); *++e = PSH; expr(Inc); *++e = MUL; ty = INT; }
-    else if (tk == Div) { next(); *++e = PSH; expr(Inc); *++e = DIV; ty = INT; }
-    else if (tk == Mod) { next(); *++e = PSH; expr(Inc); *++e = MOD; ty = INT; }
+    else if (tk == Mul) { next(); *++e = PSH; expr(Inc); *++e = MUL; ty = TYINT; }
+    else if (tk == Div) { next(); *++e = PSH; expr(Inc); *++e = DIV; ty = TYINT; }
+    else if (tk == Mod) { next(); *++e = PSH; expr(Inc); *++e = MOD; ty = TYINT; }
     else if (tk == Inc || tk == Dec) {
       if (*e == LC) { *e = PSH; *++e = LC; }
       else if (*e == LI) { *e = PSH; *++e = LI; }
       else { printf("%d: bad lvalue in post-increment\n", line); exit(-1); }
       *++e = PSH; *++e = IMM; *++e = (ty > PTR) ? 4 : 1;
       *++e = (tk == Inc) ? ADD : SUB;
-      *++e = (ty == CHAR) ? SC : SI;
+      *++e = (ty == TYCHAR) ? SC : SI;
       *++e = PSH; *++e = IMM; *++e = (ty > PTR) ? 4 : 1;
       *++e = (tk == Inc) ? SUB : ADD;
       next();
@@ -258,7 +277,7 @@ expr(int lev)
       if (t > PTR) { *++e = PSH; *++e = IMM; *++e = 4; *++e = MUL;  }
       else if (t < PTR) { printf("%d: pointer type expected\n", line); exit(-1); }
       *++e = ADD;
-      *++e = ((ty = t - PTR) == CHAR) ? LC : LI;
+      *++e = ((ty = t - PTR) == TYCHAR) ? LC : LI;
     }
     else { printf("%d: compiler error tk=%d\n", line, tk); exit(-1); }
   }
@@ -337,7 +356,7 @@ main(int argc, char **argv)
   p = "char else enum if int return while "
       "open read close printf malloc memset memcmp exit main";
   i = Char; while (i <= While) { next(); id[Tk] = i++; } // add keywords to symbol table
-  i = OPEN; while (i <= EXIT) { next(); id[Class] = Sys; id[Type] = INT; id[Val] = i++; } // add library to symbol table
+  i = OPEN; while (i <= EXIT) { next(); id[Class] = Sys; id[Type] = TYINT; id[Val] = i++; } // add library to symbol table
   next(); idmain = id; // keep track of main
 
   if (!(lp = p = malloc(poolsz))) { printf("could not malloc(%d) source area\n", poolsz); return -1; }
@@ -351,9 +370,9 @@ main(int argc, char **argv)
   line = 1;
   next();
   while (tk) {
-    bt = INT; // basetype
+    bt = TYINT; // basetype
     if (tk == Int) next();
-    else if (tk == Char) { next(); bt = CHAR; }
+    else if (tk == Char) { next(); bt = TYCHAR; }
     else if (tk == Enum) {
       next();
       if (tk != '{') next();
@@ -369,7 +388,7 @@ main(int argc, char **argv)
             i = ival;
             next();
           }
-          id[Class] = Num; id[Type] = INT; id[Val] = i++;
+          id[Class] = Num; id[Type] = TYINT; id[Val] = i++;
           if (tk == ',') next();
         }
         next();
@@ -387,9 +406,9 @@ main(int argc, char **argv)
         id[Val] = (int)(e + 1);
         next(); i = 0;
         while (tk != ')') {
-          ty = INT;
+          ty = TYINT;
           if (tk == Int) next();
-          else if (tk == Char) { next(); ty = CHAR; }
+          else if (tk == Char) { next(); ty = TYCHAR; }
           while (tk == Mul) { next(); ty = ty + PTR; }
           if (tk != Id) { printf("%d: bad parameter declaration\n", line); return -1; }
           if (id[Class] == Loc) { printf("%d: duplicate parameter definition\n", line); return -1; }
@@ -404,7 +423,7 @@ main(int argc, char **argv)
         loc = ++i;
         next();
         while (tk == Int || tk == Char) {
-          bt = (tk == Int) ? INT : CHAR;
+          bt = (tk == Int) ? TYINT : TYCHAR;
           next();
           while (tk != ';') {
             ty = bt;
@@ -537,3 +556,21 @@ main(int argc, char **argv)
   jitmain = (void *)(*(unsigned*)(idmain[Val]) >> 8 | ((unsigned)jitmem & 0xff000000));
   return jitmain(argv, argc);
 }
+
+
+#ifdef _WIN32
+#include <windows.h>
+
+void* mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
+{
+    HANDLE fm, h;
+    void * map = MAP_FAILED;
+    const off_t maxSize = off + (off_t)len;
+
+    h = (HANDLE)_get_osfhandle(fildes);
+    fm = CreateFileMapping(h, NULL, PAGE_EXECUTE_READWRITE, 0, maxSize, NULL);
+    map = MapViewOfFile(fm, FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_EXECUTE, 0, off, len);
+    CloseHandle(fm);
+    return map;
+}
+#endif        
